@@ -1,15 +1,12 @@
--- App Store for CC:Tweaked / ComputerCraft
--- Install / Update / Delete, supports subdirectories under /apps
--- Index: https://raw.githubusercontent.com/<user>/<repo>/<branch>/apps/index.txt
--- Each line is a relative path under /apps, e.g.:
---   music_player.lua
---   games/dodge.lua
+-- Stable App Store for CC:Tweaked / ComputerCraft
+-- Features: Install / Update / Delete / Refresh
+-- Supports subdirectories under /apps (e.g. games/dodge.lua)
+-- Uses http.get for robust downloads + atomic replace (temp file then move)
 
 local REPO_USER = "Ace-2778"
 local REPO_NAME = "Minecraft-lua"
 local BRANCH    = "main"
 
--- IMPORTANT: use absolute resolved path so it works no matter shell.dir()
 local APPS_DIR  = shell.resolve("apps")
 local INDEX_URL = ("https://raw.githubusercontent.com/%s/%s/%s/apps/index.txt")
   :format(REPO_USER, REPO_NAME, BRANCH)
@@ -19,29 +16,25 @@ local function remoteUrl(relPath)
     :format(REPO_USER, REPO_NAME, BRANCH, relPath)
 end
 
-if not fs.exists(APPS_DIR) then fs.makeDir(APPS_DIR) end
-
--- ---------- Utilities ----------
-local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
-
-local function readAll(path)
-  local h = fs.open(path, "r")
-  if not h then return nil end
-  local t = h.readAll()
-  h.close()
-  return t
+if not http then
+  error("HTTP is disabled. Enable it in CC:Tweaked config to use App Store.")
 end
 
+if not fs.exists(APPS_DIR) then fs.makeDir(APPS_DIR) end
+
+-- ---------- Helpers ----------
+local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+
 local function ensureDir(path)
-  if path == "" or fs.exists(path) then return end
+  if path == "" or path == "." or fs.exists(path) then return end
   local parent = fs.getDir(path)
-  if parent and parent ~= "" then ensureDir(parent) end
+  if parent and parent ~= "" and parent ~= "." then ensureDir(parent) end
   if not fs.exists(path) then fs.makeDir(path) end
 end
 
 local function ensureParentDirs(filePath)
   local parent = fs.getDir(filePath)
-  if parent and parent ~= "" then ensureDir(parent) end
+  if parent and parent ~= "" and parent ~= "." then ensureDir(parent) end
 end
 
 local function localPath(relPath)
@@ -61,34 +54,80 @@ local function deleteLocal(relPath)
   return false
 end
 
-local function downloadToLocal(relPath)
-  local url = remoteUrl(relPath)
-  local dst = localPath(relPath)
+-- Robust download: http.get -> write file
+-- Returns: ok(boolean), err(string)
+local function downloadUrlToFile(url, dst)
+  local res, err = http.get(url, { ["User-Agent"] = "CCT-AppStore" })
+  if not res then
+    return false, ("http.get failed: " .. tostring(err))
+  end
+
+  local code = res.getResponseCode and res.getResponseCode() or 200
+  if code ~= 200 then
+    local body = res.readAll() or ""
+    res.close()
+    return false, ("HTTP " .. tostring(code) .. " " .. (body:sub(1, 60)))
+  end
+
+  local data = res.readAll()
+  res.close()
+
+  if not data or #data == 0 then
+    return false, "Empty response"
+  end
 
   ensureParentDirs(dst)
 
+  local h = fs.open(dst, "wb")
+  if not h then
+    return false, "Cannot open dst for write: " .. dst
+  end
+  h.write(data)
+  h.close()
+  return true, nil
+end
+
+-- Atomic install/update:
+-- download to temp, only replace on success
+local function atomicDownload(relPath)
+  local url = remoteUrl(relPath)
+  local dst = localPath(relPath)
+  local tmp = dst .. ".tmp"
+
+  -- download to tmp first
+  if fs.exists(tmp) then fs.delete(tmp) end
+  local ok, err = downloadUrlToFile(url, tmp)
+  if not ok then
+    if fs.exists(tmp) then fs.delete(tmp) end
+    return false, err
+  end
+
+  -- replace
   if fs.exists(dst) then fs.delete(dst) end
-  return shell.run("wget", url, dst)
+  fs.move(tmp, dst)
+  return true, nil
 end
 
 -- ---------- Fetch remote index ----------
 local function fetchIndex()
-  if http and http.get then
-    local res = http.get(INDEX_URL)
-    if res then
-      local txt = res.readAll()
-      res.close()
-      return txt
-    end
+  local ok, errOrTxt = pcall(function()
+    local res, err = http.get(INDEX_URL, { ["User-Agent"] = "CCT-AppStore" })
+    if not res then return nil, ("http.get failed: " .. tostring(err)) end
+    local code = res.getResponseCode and res.getResponseCode() or 200
+    local txt = res.readAll() or ""
+    res.close()
+    if code ~= 200 then return nil, ("HTTP " .. tostring(code) .. " " .. txt:sub(1, 60)) end
+    if txt == "" then return nil, "Index empty" end
+    return txt, nil
+  end)
+
+  if not ok then
+    return nil, "fetchIndex crash: " .. tostring(errOrTxt)
   end
 
-  local tmp = shell.resolve(".app_index_tmp")
-  if fs.exists(tmp) then fs.delete(tmp) end
-  local ok = shell.run("wget", INDEX_URL, tmp)
-  if not ok then return nil end
-  local txt = readAll(tmp)
-  fs.delete(tmp)
-  return txt
+  local txt, err = errOrTxt[1], errOrTxt[2]
+  if not txt then return nil, err end
+  return txt, nil
 end
 
 local function parseIndex(txt)
@@ -96,7 +135,7 @@ local function parseIndex(txt)
   for line in txt:gmatch("[^\r\n]+") do
     line = trim(line)
     if line ~= "" and not line:match("^#") then
-      line = line:gsub("^apps/", "") -- tolerate "apps/xxx.lua"
+      line = line:gsub("^apps/", "")
       table.insert(list, line)
     end
   end
@@ -155,7 +194,6 @@ local function inside(px,py,x,y,bw,bh)
   return px>=x and px<x+bw and py>=y and py<y+bh
 end
 
--- ---------- State ----------
 local statusMsg = ""
 local remoteApps = {}
 local selected = 1
@@ -170,21 +208,13 @@ local rightX  = listX2 + 2
 
 local function setStatus(msg) statusMsg = msg or "" end
 
-local function safe(fn)
-  local ok, err = pcall(fn)
-  if not ok then
-    setStatus("ERROR: "..tostring(err))
-  end
-  return ok
-end
-
 local function drawUI()
   clear(colors.black)
 
   drawBox(1,1,w,3,colors.blue)
-  centerText(2,"🛒 App Store (Install / Update / Delete)",colors.white,colors.blue)
+  centerText(2,"🛒 App Store (Stable)",colors.white,colors.blue)
 
-  writeAt(2,4,"Remote: /apps/index.txt  | Local apps dir: "..APPS_DIR,colors.yellow,colors.black)
+  writeAt(2,4,"Local: "..APPS_DIR.."  |  Remote index: index.txt",colors.yellow,colors.black)
 
   drawBox(1,5,listX2+1,h-2,colors.black)
 
@@ -259,11 +289,11 @@ local function refreshRemote()
   setStatus("Fetching app index...")
   drawUI()
 
-  local txt = fetchIndex()
+  local txt, err = fetchIndex()
   if not txt then
     remoteApps = {}
     selected, scroll = 1, 0
-    setStatus("ERROR: Can't fetch index. HTTP enabled?")
+    setStatus("Index fetch failed: "..tostring(err))
     return
   end
 
@@ -277,12 +307,15 @@ local function doInstall()
   if not app then setStatus("No app selected.") return end
   if existsLocal(app) then setStatus("Already installed.") return end
 
-  safe(function()
-    setStatus("Installing "..app.." ...")
-    drawUI()
-    local ok = downloadToLocal(app)
-    if ok then setStatus("Installed: "..app) else setStatus("ERROR: wget failed.") end
-  end)
+  setStatus("Installing "..app.." ...")
+  drawUI()
+
+  local ok, err = atomicDownload(app)
+  if ok then
+    setStatus("Installed: "..app)
+  else
+    setStatus("Install failed: "..tostring(err))
+  end
 end
 
 local function doUpdate()
@@ -290,12 +323,15 @@ local function doUpdate()
   if not app then setStatus("No app selected.") return end
   if not existsLocal(app) then setStatus("Not installed.") return end
 
-  safe(function()
-    setStatus("Updating "..app.." ...")
-    drawUI()
-    local ok = downloadToLocal(app)
-    if ok then setStatus("Updated: "..app) else setStatus("ERROR: wget failed.") end
-  end)
+  setStatus("Updating "..app.." ...")
+  drawUI()
+
+  local ok, err = atomicDownload(app)
+  if ok then
+    setStatus("Updated: "..app)
+  else
+    setStatus("Update failed: "..tostring(err))
+  end
 end
 
 local function doDelete()
@@ -303,19 +339,14 @@ local function doDelete()
   if not app then setStatus("No app selected.") return end
   if not existsLocal(app) then setStatus("Not installed.") return end
 
-  safe(function()
-    setStatus("Deleting "..app.." ...")
-    drawUI()
-    deleteLocal(app)
-    setStatus("Deleted: "..app)
-  end)
+  setStatus("Deleting "..app.." ...")
+  drawUI()
+
+  deleteLocal(app)
+  setStatus("Deleted: "..app)
 end
 
--- ---------- Start ----------
-if not http then
-  error("HTTP is disabled. Enable it in CC:Tweaked config to use App Store.")
-end
-
+-- ---------- Main ----------
 refreshRemote()
 
 while true do
