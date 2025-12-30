@@ -1,15 +1,32 @@
--- CC:Tweaked Music Player (GUI)
--- Requires: speaker peripheral + DFPWM files in /music
+-- CC:Tweaked Music Player (GUI) - Stream from GitHub music folder
+-- Requires: speaker peripheral + HTTP enabled + DFPWM files in GitHub repo music/
+-- Requires: music/index.txt in repo
 
 local speaker = peripheral.find("speaker")
 if not speaker then
   error("No speaker found! Place a speaker next to the computer.")
 end
 
+if not http then
+  error("HTTP API disabled! Enable http in CC:Tweaked config.")
+end
+
 local dfpwm = require("cc.audio.dfpwm")
 local decoder = dfpwm.make_decoder()
 
-local MUSIC_DIR = "music"
+-- ====== Repo Config ======
+local REPO_USER = "Ace-2778"
+local REPO_NAME = "Minecraft-lua"
+local BRANCH = "main"
+
+local INDEX_URL = ("https://raw.githubusercontent.com/%s/%s/%s/music/index.txt")
+  :format(REPO_USER, REPO_NAME, BRANCH)
+
+local function musicUrl(path)
+  -- path is relative to music/ (may include subdirs)
+  return ("https://raw.githubusercontent.com/%s/%s/%s/music/%s")
+    :format(REPO_USER, REPO_NAME, BRANCH, path)
+end
 
 -- ---------- UI Helpers ----------
 local w, h = term.getSize()
@@ -30,8 +47,8 @@ end
 
 local function drawBox(x1, y1, x2, y2, bg)
   term.setBackgroundColor(bg or colors.gray)
-  for y = y1, y2 do
-    term.setCursorPos(x1, y)
+  for yy = y1, y2 do
+    term.setCursorPos(x1, yy)
     term.write(string.rep(" ", x2 - x1 + 1))
   end
 end
@@ -49,57 +66,80 @@ local function isInside(px, py, x, y, bw, bh)
   return px >= x and px < x + bw and py >= y and py < y + bh
 end
 
--- ---------- File Helpers ----------
-local function listMusic()
-  if not fs.exists(MUSIC_DIR) then
-    fs.makeDir(MUSIC_DIR)
+-- ---------- Remote Music Helpers ----------
+local function fetchIndex()
+  local res, err = http.get(INDEX_URL, { ["User-Agent"] = "CCT-MusicPlayer" })
+  if not res then
+    return nil, "Index http.get failed: " .. tostring(err)
   end
 
-  local files = fs.list(MUSIC_DIR)
-  local songs = {}
+  local code = res.getResponseCode and res.getResponseCode() or 200
+  local txt = res.readAll() or ""
+  res.close()
 
-  for _, f in ipairs(files) do
-    if f:lower():match("%.dfpwm$") then
-      table.insert(songs, f)
+  if code ~= 200 then
+    return nil, "Index HTTP " .. tostring(code) .. " " .. txt:sub(1, 80)
+  end
+  if txt == "" then
+    return nil, "Index empty"
+  end
+  return txt, nil
+end
+
+local function parseIndex(txt)
+  local list = {}
+  for line in txt:gmatch("[^\r\n]+") do
+    line = line:gsub("^%s+", ""):gsub("%s+$", "")
+    if line ~= "" and not line:match("^#") then
+      table.insert(list, line)
     end
   end
+  table.sort(list)
+  return list
+end
 
-  table.sort(songs)
-  return songs
+local function listMusicRemote()
+  local txt, err = fetchIndex()
+  if not txt then
+    return {}, err
+  end
+  return parseIndex(txt), nil
 end
 
 -- ---------- Player State ----------
-local songs = listMusic()
+local songs = {}
 local selected = 1
 local playing = false
 local paused = false
 local currentSong = nil
 
+local statusMsg = ""
+
 local scroll = 0
 local listHeight = h - 9
 if listHeight < 5 then listHeight = 5 end
 
--- progress simulation
+-- progress
 local bytesPlayed = 0
-local totalBytes = 1
+local totalBytes = 0   -- if unknown, keep 0
 local progress = 0
 
--- playback coroutine state
+-- playback coroutine
 local playbackThread = nil
 local stopRequested = false
 
--- ---------- Playback ----------
-local function getFileSize(path)
-  if not fs.exists(path) then return 1 end
-  return fs.getSize(path) or 1
+local function setStatus(msg)
+  statusMsg = msg or ""
 end
 
+-- ---------- Playback (stream from GitHub) ----------
 local function stopSong()
   stopRequested = true
   playing = false
   paused = false
   progress = 0
   bytesPlayed = 0
+  totalBytes = 0
 end
 
 local function playSong(name)
@@ -107,30 +147,57 @@ local function playSong(name)
   stopRequested = false
 
   currentSong = name
-  local path = fs.combine(MUSIC_DIR, name)
-  totalBytes = getFileSize(path)
   bytesPlayed = 0
   progress = 0
+  totalBytes = 0
   playing = true
   paused = false
 
+  local url = musicUrl(name)
+
   playbackThread = coroutine.create(function()
-    local handle = fs.open(path, "rb")
-    if not handle then
+    local res, err = http.get(url, { ["User-Agent"] = "CCT-MusicPlayer" })
+    if not res then
+      setStatus("Play failed: " .. tostring(err))
       playing = false
       return
     end
 
+    local code = res.getResponseCode and res.getResponseCode() or 200
+    if code ~= 200 then
+      local body = res.readAll() or ""
+      res.close()
+      setStatus("Play HTTP " .. tostring(code) .. " " .. body:sub(1, 60))
+      playing = false
+      return
+    end
+
+    -- Try get content length if supported
+    if res.getResponseHeaders then
+      local headers = res.getResponseHeaders()
+      if headers and headers["Content-Length"] then
+        totalBytes = tonumber(headers["Content-Length"]) or 0
+      end
+    end
+
+    setStatus("Streaming: " .. name)
+
     while true do
       if stopRequested then break end
+
       if paused then
         os.sleep(0.05)
       else
-        local chunk = handle.read(16 * 1024)
+        -- read in chunks
+        local chunk = res.read(16 * 1024)
         if not chunk then break end
 
         bytesPlayed = bytesPlayed + #chunk
-        progress = bytesPlayed / totalBytes
+        if totalBytes > 0 then
+          progress = bytesPlayed / totalBytes
+        else
+          progress = 0 -- unknown
+        end
 
         local buffer = decoder(chunk)
         while not speaker.playAudio(buffer) do
@@ -140,9 +207,10 @@ local function playSong(name)
       end
     end
 
-    handle.close()
+    res.close()
     playing = false
     paused = false
+    setStatus("Finished: " .. name)
   end)
 end
 
@@ -172,14 +240,14 @@ local function drawUI()
 
   -- Header
   drawBox(1, 1, w, 3, colors.blue)
-  centerText(2, "🎵 CCT Music Player", colors.white, colors.blue)
+  centerText(2, "🎵 CCT Music Player (GitHub Stream)", colors.white, colors.blue)
 
   -- Songs list panel
   drawBox(1, 4, math.floor(w * 0.55), h, colors.black)
   term.setCursorPos(2, 4)
   term.setTextColor(colors.yellow)
   term.setBackgroundColor(colors.black)
-  term.write("Songs (./music/*.dfpwm)")
+  term.write("Songs (GitHub /music/index.txt)")
 
   local listX1 = 2
   local listY1 = 6
@@ -236,7 +304,10 @@ local function drawUI()
   term.write("Progress:")
 
   local barW = w - (rightX + 2)
-  local filled = math.floor(barW * progress)
+  local filled = 0
+  if totalBytes > 0 then
+    filled = math.floor(barW * clamp(progress, 0, 1))
+  end
 
   term.setCursorPos(rightX + 1, 9)
   term.setBackgroundColor(colors.gray)
@@ -249,7 +320,11 @@ local function drawUI()
   term.setBackgroundColor(colors.black)
   term.setCursorPos(rightX + 1, 10)
   term.setTextColor(colors.white)
-  term.write(string.format("%d%%", math.floor(progress * 100)))
+  if totalBytes > 0 then
+    term.write(string.format("%d%%", math.floor(progress * 100)))
+  else
+    term.write("Streaming... (size unknown)")
+  end
 
   -- Buttons
   local bx = rightX + 1
@@ -260,11 +335,15 @@ local function drawUI()
   local btnNextW = drawButton(bx + btnPrevW + btnPlayW + 2, by, ">>", false)
   local btnStopW = drawButton(w - 6, by, "Stop", false)
 
-  -- footer tips
-  term.setCursorPos(rightX + 1, h - 1)
+  -- footer tips + status
+  term.setCursorPos(rightX + 1, h - 2)
   term.setTextColor(colors.lightGray)
   term.setBackgroundColor(colors.black)
-  term.write("Click song | Mouse wheel scroll | Q to quit")
+  term.write("Click song | Wheel scroll | Q quit")
+
+  term.setCursorPos(rightX + 1, h - 1)
+  term.setTextColor(colors.orange)
+  term.write(statusMsg:sub(1, w - rightX - 1))
 end
 
 local function handleClick(x, y)
@@ -285,19 +364,15 @@ local function handleClick(x, y)
   local bx = rightX + 1
   local by = h - 3
 
-  -- reconstruct button widths
   local prevW = 4
   local playW = (playing and (paused and 8 or 7) or 6) + 2
   local nextW = 4
   local stopW = 6
 
-  -- Prev
   if isInside(x, y, bx, by, prevW, 1) then
-    prevSong()
-    return
+    prevSong(); return
   end
 
-  -- Play/Pause
   if isInside(x, y, bx + prevW + 1, by, playW, 1) then
     if not playing then
       if songs[selected] then playSong(songs[selected]) end
@@ -307,29 +382,39 @@ local function handleClick(x, y)
     return
   end
 
-  -- Next
   if isInside(x, y, bx + prevW + playW + 2, by, nextW, 1) then
-    nextSong()
-    return
+    nextSong(); return
   end
 
-  -- Stop
   if isInside(x, y, w - stopW, by, stopW, 1) then
-    stopSong()
-    return
+    stopSong(); setStatus("Stopped"); return
   end
 end
 
--- ---------- Main Loop ----------
+-- ---------- Startup ----------
 local function refreshSongs()
-  songs = listMusic()
-  if selected > #songs then selected = #songs end
-  if selected < 1 then selected = 1 end
+  setStatus("Fetching music list...")
+  drawUI()
+  local list, err = listMusicRemote()
+  if err then
+    songs = {}
+    selected = 1
+    setStatus(err)
+  else
+    songs = list
+    if #songs == 0 then
+      setStatus("No songs in music/index.txt")
+    else
+      setStatus("Loaded " .. #songs .. " song(s).")
+    end
+    selected = clamp(selected, 1, math.max(1, #songs))
+  end
 end
 
 refreshSongs()
 drawUI()
 
+-- ---------- Main Loop ----------
 while true do
   drawUI()
 
@@ -337,6 +422,7 @@ while true do
   if playbackThread and coroutine.status(playbackThread) ~= "dead" then
     local ok, err = coroutine.resume(playbackThread)
     if not ok then
+      setStatus("Playback error: " .. tostring(err))
       playing = false
       paused = false
       playbackThread = nil
@@ -347,11 +433,9 @@ while true do
   local ev = e[1]
 
   if ev == "mouse_click" then
-    local btn, x, y = e[2], e[3], e[4]
-    handleClick(x, y)
+    handleClick(e[3], e[4])
   elseif ev == "mouse_scroll" then
-    local dir = e[2]
-    scroll = scroll + dir
+    scroll = scroll + e[2]
   elseif ev == "key" then
     local k = e[2]
     if k == keys.q then
@@ -375,18 +459,13 @@ while true do
     elseif k == keys.right then
       nextSong()
     elseif k == keys.s then
-      stopSong()
+      stopSong(); setStatus("Stopped")
+    elseif k == keys.r then
+      refreshSongs()
     end
   elseif ev == "term_resize" then
     w, h = term.getSize()
     listHeight = h - 9
     if listHeight < 5 then listHeight = 5 end
-  end
-
-  -- Auto next song when finished
-  if playing == false and paused == false and currentSong ~= nil and not stopRequested then
-    -- finished naturally
-    currentSong = nil
-    progress = 0
   end
 end
